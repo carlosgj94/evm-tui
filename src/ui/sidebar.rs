@@ -6,7 +6,6 @@ use crate::{
     },
     components::Component,
 };
-use super::util::short_hex;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
