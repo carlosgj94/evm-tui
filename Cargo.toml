@@ -13,7 +13,7 @@ color-eyre = "0.6.3"
 fjall = "2.11.2"
 anyhow = "1.0.100"
 alloy = { version = "1.0.41", features = ["full"] }
-dirs = "5.0.1"
+dirs = "6.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time"] }
