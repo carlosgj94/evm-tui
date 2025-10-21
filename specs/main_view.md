@@ -6,6 +6,7 @@ Display detailed information for the active address or transaction and host adva
 ## Address Layout
 - Tabs: `Transactions`, `Internal`, `Balances`, `Permissions`.
 - Default to Transactions list with pagination and filters by chain or method signature.
+- Transactions tab surfaces the most recent on-chain activity fetched from the configured Anvil RPC endpoint and explains when no transactions were found in the recent block window.
 - Internal tab surfaces internal calls with call tree visualization.
 - Balances tab aggregates token balances (native and ERC20) with fiat estimates when available.
 - Permissions tab lists contracts where the address has roles; highlight high-risk scopes.

@@ -7,15 +7,17 @@ use std::{
 
 mod repositories;
 
-pub use repositories::{FavoriteRecord, FavoritesRepository, SettingsRepository};
+pub use repositories::{
+    FavoriteRecord, FavoritesRepository, SecretKey, SecretsRepository, SettingsRepository,
+};
 
 pub struct Storage {
-    root: PathBuf,
     #[allow(dead_code)]
     keyspace: Keyspace,
     favorites_addresses: FavoritesRepository,
     favorites_transactions: FavoritesRepository,
     settings: SettingsRepository,
+    secrets: SecretsRepository,
 }
 
 impl Storage {
@@ -25,21 +27,22 @@ impl Storage {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        let root = path.as_ref();
+        fs::create_dir_all(root)?;
 
-        let keyspace = Config::new(&root).open()?;
+        let keyspace = Config::new(root).open()?;
         let favorites_addresses =
             keyspace.open_partition("favorites_addresses", PartitionCreateOptions::default())?;
         let favorites_transactions =
             keyspace.open_partition("favorites_transactions", PartitionCreateOptions::default())?;
         let settings = keyspace.open_partition("settings", PartitionCreateOptions::default())?;
+        let secrets = keyspace.open_partition("secrets", PartitionCreateOptions::default())?;
 
         Ok(Self {
-            root,
             favorites_addresses: FavoritesRepository::new(favorites_addresses),
             favorites_transactions: FavoritesRepository::new(favorites_transactions),
             settings: SettingsRepository::new(settings),
+            secrets: SecretsRepository::new(secrets),
             keyspace,
         })
     }
@@ -56,8 +59,8 @@ impl Storage {
         &self.settings
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn secrets(&self) -> &SecretsRepository {
+        &self.secrets
     }
 }
 

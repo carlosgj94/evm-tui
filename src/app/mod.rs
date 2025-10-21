@@ -1,26 +1,35 @@
 use crate::{
     components::Component,
-    storage::{FavoriteRecord, Storage},
+    storage::{FavoriteRecord, SecretKey, SecretsRepository, Storage},
     ui::util::short_hex,
     ui::{
         bottom_bar::BottomBar,
         main_view::{MainView, MainViewCommand},
+        modal::{SecretsModal, secrets::SecretsFormCommand},
         sidebar::{Sidebar, SidebarCommand},
         top::{TopBar, TopCommand},
     },
 };
 pub type AppResult<T> = color_eyre::Result<T>;
+use alloy::primitives::{Address, U256, utils::format_units};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
 };
-use std::{collections::HashSet, sync::mpsc, thread, time::Instant};
+use std::{collections::HashSet, env, sync::mpsc, time::Instant};
 
 use tokio::runtime::{Handle, Runtime};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep, timeout};
 
 pub use navigation::{FocusedPane, MainViewMode, MainViewTab, SidebarTab};
+
+mod anvil;
+use self::anvil::{AccountOverview, fetch_account_overview, fetch_latest_block};
+mod etherscan;
+use self::etherscan::{
+    AddressTransaction, TransactionFetchError, TransactionListSource, fetch_address_transactions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectedEntity {
@@ -45,10 +54,12 @@ pub struct TransactionRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HydratedAddress {
     pub identifier: String,
+    pub info: Vec<String>,
     pub transactions: Vec<String>,
     pub internal: Vec<String>,
     pub balances: Vec<String>,
     pub permissions: Vec<String>,
+    pub overview: Option<AccountOverview>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,43 @@ pub struct HydratedTransaction {
     pub summary: Vec<String>,
     pub debug: Vec<String>,
     pub storage_diff: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SecretsState {
+    pub etherscan_api_key: Option<String>,
+    pub anvil_rpc_url: Option<String>,
+}
+
+impl SecretsState {
+    fn load(storage: &Storage) -> AppResult<Self> {
+        let repo = storage.secrets();
+        Ok(Self {
+            etherscan_api_key: Self::resolve_secret(repo, SecretKey::EtherscanApiKey)?,
+            anvil_rpc_url: Self::resolve_secret(repo, SecretKey::AnvilRpcUrl)?,
+        })
+    }
+
+    fn resolve_secret(repo: &SecretsRepository, key: SecretKey) -> AppResult<Option<String>> {
+        if let Ok(value) = env::var(key.env_var()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                repo.set(key, trimmed)?;
+                return Ok(Some(trimmed.to_string()));
+            }
+            repo.remove(key)?;
+            return Ok(None);
+        }
+        let stored = repo.get(key)?;
+        Ok(stored.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }))
+    }
 }
 
 /// Central application type that orchestrates state and delegates to UI components.
@@ -69,15 +117,16 @@ pub struct App {
     main_view: MainView,
     bottom_bar: BottomBar,
     runtime: Runtime,
-    runtime_handle: Handle,
     message_rx: mpsc::Receiver<Message>,
     message_tx: mpsc::Sender<Message>,
+    secrets_modal: Option<SecretsModal>,
 }
 
 impl App {
     pub fn new() -> AppResult<Self> {
         let mut state = AppState::default();
         let mut storage = Storage::open_default()?;
+        state.secrets = SecretsState::load(&storage)?;
         let mut top_bar = TopBar::default();
         let mut sidebar = Sidebar::default();
         let mut main_view = MainView::default();
@@ -96,6 +145,21 @@ impl App {
             sidebar.init(&mut ctx)?;
             main_view.init(&mut ctx)?;
             bottom_bar.init(&mut ctx)?;
+        }
+
+        let mut secrets_modal = None;
+        if state.secrets.etherscan_api_key.is_none() || state.secrets.anvil_rpc_url.is_none() {
+            let mut modal = SecretsModal::new();
+            {
+                let mut ctx = AppContext {
+                    state: &mut state,
+                    storage: &mut storage,
+                    commands: CommandBus::new(message_tx.clone(), runtime_handle.clone()),
+                };
+                modal.init(&mut ctx)?;
+            }
+            state.navigation.focus_modal();
+            secrets_modal = Some(modal);
         }
 
         // Hydrate favorites from storage
@@ -159,9 +223,9 @@ impl App {
             main_view,
             bottom_bar,
             runtime,
-            runtime_handle,
             message_rx,
             message_tx,
+            secrets_modal,
         })
     }
 
@@ -203,11 +267,17 @@ impl App {
         self.sidebar.render(frame, sidebar_area, &view);
         self.main_view.render(frame, content_area, &view);
         self.bottom_bar.render(frame, bottom_area, &view);
+
+        if let Some(modal) = self.secrets_modal.as_mut() {
+            let area = frame.area();
+            modal.render(frame, area, &view);
+        }
     }
 
     fn handle_events(&mut self) -> AppResult<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key)?,
+            Event::Paste(content) => self.on_paste_event(content)?,
             Event::Mouse(_) | Event::Resize(_, _) => {}
             _ => {}
         }
@@ -215,6 +285,11 @@ impl App {
     }
 
     fn on_key_event(&mut self, key: KeyEvent) -> AppResult<()> {
+        if matches!(self.state.navigation.focused_pane, FocusedPane::Modal) {
+            self.handle_modal_key(key)?;
+            return Ok(());
+        }
+
         if self.top_bar.is_search_active() {
             match key.code {
                 KeyCode::Esc => {
@@ -289,10 +364,172 @@ impl App {
         Ok(())
     }
 
+    fn on_paste_event(&mut self, content: String) -> AppResult<()> {
+        if matches!(self.state.navigation.focused_pane, FocusedPane::Modal) {
+            self.handle_modal_paste(content)?;
+        } else if self.top_bar.is_search_active() {
+            self.handle_search_paste(content)?;
+        }
+        Ok(())
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent) -> AppResult<()> {
+        use crossterm::event::KeyCode;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            self.dispatch(Action::Quit);
+            return Ok(());
+        }
+
+        if let Some(command) = SecretsModal::command_from_key(key) {
+            let commands = self.command_bus();
+            let action = if let Some(modal) = self.secrets_modal.as_mut() {
+                let mut ctx = AppContext {
+                    state: &mut self.state,
+                    storage: &mut self.storage,
+                    commands,
+                };
+                modal.update(&command, &mut ctx)?
+            } else {
+                None
+            };
+            if let Some(action) = action {
+                self.dispatch(action);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_modal_paste(&mut self, content: String) -> AppResult<()> {
+        if self.secrets_modal.is_some() {
+            let commands = self.command_bus();
+            let action = if let Some(modal) = self.secrets_modal.as_mut() {
+                let mut ctx = AppContext {
+                    state: &mut self.state,
+                    storage: &mut self.storage,
+                    commands,
+                };
+                modal.update(&SecretsFormCommand::InsertText(content), &mut ctx)?
+            } else {
+                None
+            };
+            if let Some(action) = action {
+                self.dispatch(action);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_search_paste(&mut self, content: String) -> AppResult<()> {
+        for ch in content.chars() {
+            if matches!(ch, '\r' | '\n') {
+                continue;
+            }
+            self.top_bar_command(TopCommand::InputChar(ch))?;
+        }
+        Ok(())
+    }
+
+    async fn hydrate_address(addr: AddressRef, secrets: SecretsState) -> HydratedAddress {
+        const TRANSACTION_FETCH_LIMIT: usize = 25;
+        let mut rpc_url = secrets.anvil_rpc_url.clone();
+        if rpc_url.is_none() {
+            if let Ok(env_url) = std::env::var("ANVIL_RPC_URL") {
+                if !env_url.trim().is_empty() {
+                    rpc_url = Some(env_url);
+                }
+            }
+        }
+
+        let mut overview: Option<AccountOverview> = None;
+        let mut note: Option<String> = None;
+        let mut block_note: Option<String> = None;
+
+        if let Some(rpc_value) = rpc_url.clone() {
+            match addr.address.parse::<Address>() {
+                Ok(parsed) => {
+                    match timeout(
+                        Duration::from_secs(10),
+                        fetch_account_overview(&rpc_value, parsed),
+                    )
+                    .await
+                    {
+                        Ok(Ok(data)) => {
+                            block_note = None;
+                            overview = Some(data);
+                        }
+                        Ok(Err(error)) => {
+                            note = Some(format!("Failed to load account data: {error}"));
+                            if let Ok(result) =
+                                timeout(Duration::from_secs(4), fetch_latest_block(&rpc_value))
+                                    .await
+                            {
+                                if let Ok(block) = result {
+                                    block_note = Some(format!("Latest block observed: {block}"));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            note = Some(format!("Account query to {rpc_value} timed out"));
+                            if let Ok(result) =
+                                timeout(Duration::from_secs(4), fetch_latest_block(&rpc_value))
+                                    .await
+                            {
+                                if let Ok(block) = result {
+                                    block_note = Some(format!("Latest block observed: {block}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    note = Some("Address is not a valid hexadecimal string".into());
+                }
+            }
+        } else {
+            note = Some("Configure an Anvil RPC endpoint to load account data.".into());
+        }
+
+        let transactions_result = fetch_address_transactions(
+            &addr,
+            secrets.etherscan_api_key.as_deref(),
+            TRANSACTION_FETCH_LIMIT,
+        )
+        .await;
+
+        let mut hydrated = build_address_view(addr, overview, note, rpc_url, block_note);
+
+        hydrated.transactions = match transactions_result {
+            Ok((entries, source)) => format_transaction_lines(
+                &hydrated.identifier,
+                &entries,
+                &source,
+                TRANSACTION_FETCH_LIMIT,
+            ),
+            Err(TransactionFetchError::MissingApiKey) => vec![
+                "Add an Etherscan API key to load recent transactions.".into(),
+                "Open Settings → Secrets and enter ETHERSCAN_API_KEY.".into(),
+            ],
+            Err(TransactionFetchError::UnsupportedChain(chain)) => vec![format!(
+                "No Etherscan-compatible explorer configured for chain {chain}."
+            )],
+            Err(err) => vec![format!("Failed to load transactions: {err}")],
+        };
+
+        hydrated
+    }
+
+    #[cfg(test)]
+    fn secrets_modal_mut(&mut self) -> Option<&mut SecretsModal> {
+        self.secrets_modal.as_mut()
+    }
+
     fn dispatch(&mut self, action: Action) {
         match action {
             Action::Quit => self.running = false,
-            Action::FocusPane(pane) => self.state.navigation.focused_pane = pane,
+            Action::FocusPane(pane) => self.state.navigation.focus_pane(pane),
             Action::FocusNextPane => self.state.navigation.focus_next(),
             Action::FocusPreviousPane => self.state.navigation.focus_previous(),
             Action::SelectionChanged(entity) => {
@@ -301,7 +538,7 @@ impl App {
                 match entity {
                     SelectedEntity::Address(_) => {
                         self.state.navigation.main_view_mode = MainViewMode::Address;
-                        self.state.navigation.main_view_tab = MainViewTab::AddressTransactions;
+                        self.state.navigation.main_view_tab = MainViewTab::AddressInfo;
                     }
                     SelectedEntity::Transaction(_) => {
                         self.state.navigation.main_view_mode = MainViewMode::Transaction;
@@ -312,7 +549,11 @@ impl App {
             }
             Action::LoadingStarted(pane) => self.state.loading.set_loading(pane, true),
             Action::LoadingFinished(pane) => self.state.loading.set_loading(pane, false),
-            Action::Noop => {}
+            Action::CloseModal => self.close_modal(),
+            Action::SecretsSaved => {
+                self.close_modal();
+                self.show_status("Secrets updated");
+            }
         }
     }
 
@@ -347,10 +588,11 @@ impl App {
     }
 
     fn sidebar_command(&mut self, command: SidebarCommand) -> AppResult<()> {
+        let commands = self.command_bus();
         let mut ctx = AppContext {
             state: &mut self.state,
             storage: &mut self.storage,
-            commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+            commands,
         };
         if let Some(action) = self.sidebar.update(&command, &mut ctx)? {
             self.dispatch(action);
@@ -359,10 +601,11 @@ impl App {
     }
 
     fn main_view_command(&mut self, command: MainViewCommand) -> AppResult<()> {
+        let commands = self.command_bus();
         let mut ctx = AppContext {
             state: &mut self.state,
             storage: &mut self.storage,
-            commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+            commands,
         };
         if let Some(action) = self.main_view.update(&command, &mut ctx)? {
             self.dispatch(action);
@@ -371,10 +614,11 @@ impl App {
     }
 
     fn top_bar_command(&mut self, command: TopCommand) -> AppResult<()> {
+        let commands = self.command_bus();
         let mut ctx = AppContext {
             state: &mut self.state,
             storage: &mut self.storage,
-            commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+            commands,
         };
         if let Some(action) = self.top_bar.update(&command, &mut ctx)? {
             self.dispatch(action);
@@ -383,7 +627,19 @@ impl App {
     }
 
     fn command_bus(&self) -> CommandBus {
-        CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone())
+        let handle = self.runtime.handle().clone();
+        CommandBus::new(self.message_tx.clone(), handle)
+    }
+
+    fn close_modal(&mut self) {
+        self.secrets_modal = None;
+        self.state.navigation.restore_focus_after_modal();
+    }
+
+    fn show_status(&mut self, message: impl Into<String>) {
+        if let Err(err) = self.top_bar_command(TopCommand::ShowStatus(message.into())) {
+            eprintln!("failed to update status: {err:?}");
+        }
     }
 
     fn start_hydration(&mut self, entity: SelectedEntity) {
@@ -391,22 +647,18 @@ impl App {
             SelectedEntity::Address(addr) => {
                 self.state.current_address = None;
                 self.state.loading.set_loading(FocusedPane::MainView, true);
+                self.show_status(format!(
+                    "Fetching latest activity for {}",
+                    short_hex(&addr.address)
+                ));
                 let bus = self.command_bus();
+                let secrets = self.state.secrets.clone();
                 bus.spawn_async(move || {
                     let addr_ref = addr.clone();
+                    let secrets_clone = secrets.clone();
                     async move {
-                        sleep(Duration::from_millis(350)).await;
-                        let short = short_hex(&addr_ref.address);
-                        Message::AddressHydrated(HydratedAddress {
-                            identifier: addr_ref.address.clone(),
-                            transactions: vec![
-                                format!("{} • received 1.2 ETH", short),
-                                format!("{} • sent 0.5 ETH", short),
-                            ],
-                            internal: vec!["delegatecall → vault".into()],
-                            balances: vec!["ETH: 1.23".into(), "USDC: 2,500".into()],
-                            permissions: vec!["Owner: Multisig 0xABCD…".into()],
-                        })
+                        let data = Self::hydrate_address(addr_ref.clone(), secrets_clone).await;
+                        Message::AddressHydrated(data)
                     }
                 });
             }
@@ -495,46 +747,66 @@ impl App {
 
     fn tick(&mut self) -> AppResult<()> {
         {
+            let commands = self.command_bus();
             let (state, storage) = (&mut self.state, &mut self.storage);
             let mut ctx = AppContext {
                 state,
                 storage,
-                commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+                commands,
             };
             if let Some(action) = self.top_bar.tick(&mut ctx)? {
                 self.dispatch(action);
             }
         }
         {
+            let commands = self.command_bus();
             let (state, storage) = (&mut self.state, &mut self.storage);
             let mut ctx = AppContext {
                 state,
                 storage,
-                commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+                commands,
             };
             if let Some(action) = self.sidebar.tick(&mut ctx)? {
                 self.dispatch(action);
             }
         }
         {
+            let commands = self.command_bus();
             let (state, storage) = (&mut self.state, &mut self.storage);
             let mut ctx = AppContext {
                 state,
                 storage,
-                commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+                commands,
             };
             if let Some(action) = self.main_view.tick(&mut ctx)? {
                 self.dispatch(action);
             }
         }
         {
+            let commands = self.command_bus();
             let (state, storage) = (&mut self.state, &mut self.storage);
             let mut ctx = AppContext {
                 state,
                 storage,
-                commands: CommandBus::new(self.message_tx.clone(), self.runtime_handle.clone()),
+                commands,
             };
             if let Some(action) = self.bottom_bar.tick(&mut ctx)? {
+                self.dispatch(action);
+            }
+        }
+        if self.secrets_modal.is_some() {
+            let commands = self.command_bus();
+            let action = if let Some(modal) = self.secrets_modal.as_mut() {
+                let mut ctx = AppContext {
+                    state: &mut self.state,
+                    storage: &mut self.storage,
+                    commands,
+                };
+                modal.tick(&mut ctx)?
+            } else {
+                None
+            };
+            if let Some(action) = action {
                 self.dispatch(action);
             }
         }
@@ -565,7 +837,29 @@ impl App {
                 Message::AddressHydrated(data) => {
                     if let Some(SelectedEntity::Address(addr)) = self.state.selected.as_ref() {
                         if addr.address == data.identifier {
+                            let status_message = data
+                                .overview
+                                .as_ref()
+                                .and_then(|ov| {
+                                    format_units(ov.balance_wei, "ether")
+                                        .ok()
+                                        .map(|balance| format!("Balance: {balance} ETH"))
+                                })
+                                .or_else(|| {
+                                    data.info
+                                        .iter()
+                                        .find(|line| {
+                                            line.contains("Balance")
+                                                || line.contains("Failed")
+                                                || line.contains("Account query")
+                                                || line.contains("Configure an Anvil")
+                                        })
+                                        .cloned()
+                                })
+                                .or_else(|| data.info.first().cloned())
+                                .unwrap_or_else(|| "No account data available.".into());
                             self.state.current_address = Some(data);
+                            self.show_status(status_message);
                             self.dispatch(Action::LoadingFinished(FocusedPane::MainView));
                         }
                     }
@@ -579,6 +873,179 @@ impl App {
                     }
                 }
             }
+        }
+    }
+}
+
+pub(crate) fn build_address_view(
+    addr: AddressRef,
+    overview: Option<AccountOverview>,
+    note: Option<String>,
+    rpc_endpoint: Option<String>,
+    block_note: Option<String>,
+) -> HydratedAddress {
+    let mut info = Vec::new();
+    let mut transactions = Vec::new();
+
+    if let Some(url) = rpc_endpoint.as_ref() {
+        info.push(format!("RPC endpoint: {url}"));
+    }
+
+    if let Some(summary) = overview.as_ref() {
+        info.push(format!("Latest block: {}", summary.latest_block));
+        let balance_eth = format_units(summary.balance_wei, "ether")
+            .unwrap_or_else(|_| summary.balance_wei.to_string());
+        info.push(format!(
+            "Balance: {} ETH ({} wei)",
+            balance_eth, summary.balance_wei
+        ));
+        info.push(format!(
+            "Transaction count (nonce): {}",
+            summary.transaction_count
+        ));
+        info.push(format!(
+            "Account type: {}",
+            if summary.is_contract {
+                "Contract"
+            } else {
+                "Externally Owned Account"
+            }
+        ));
+    }
+
+    if let Some(block_line) = block_note {
+        info.push(block_line);
+    }
+
+    if let Some(message) = note {
+        info.push(message);
+    }
+
+    if info.is_empty() {
+        info.push("No account data available.".into());
+    }
+
+    if transactions.is_empty() {
+        transactions.push("Transactions not yet implemented.".into());
+    }
+
+    let internal = vec!["Internal transactions not yet implemented.".into()];
+    let balances = vec!["Balance inspection not yet implemented.".into()];
+    let permissions = vec!["Permission analysis not yet implemented.".into()];
+
+    HydratedAddress {
+        identifier: addr.address,
+        info,
+        transactions,
+        internal,
+        balances,
+        permissions,
+        overview,
+    }
+}
+
+fn format_transaction_lines(
+    target_address: &str,
+    entries: &[AddressTransaction],
+    source: &TransactionListSource,
+    limit: usize,
+) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![format!(
+            "No transactions available via {} ({}).",
+            source.label, source.api_version
+        )];
+    }
+
+    let mut lines = Vec::with_capacity(entries.len() + 1);
+    lines.push(format!(
+        "Showing {} transaction(s) via {} ({}) (max {}).",
+        entries.len(),
+        source.label,
+        source.api_version,
+        limit
+    ));
+
+    for tx in entries {
+        lines.push(format_transaction_line(target_address, tx));
+    }
+
+    lines
+}
+
+fn format_transaction_line(target_address: &str, tx: &AddressTransaction) -> String {
+    let is_sender = tx.from.eq_ignore_ascii_case(target_address);
+    let is_recipient = tx
+        .to
+        .as_ref()
+        .map(|addr| addr.eq_ignore_ascii_case(target_address))
+        .unwrap_or(false);
+
+    let mut line = String::new();
+    if tx.is_error {
+        line.push_str("FAILED | ");
+    }
+
+    if tx.block_number > 0 {
+        line.push_str(&format!("Block {}", tx.block_number));
+    } else {
+        line.push_str("Block ?");
+    }
+
+    let value = format_eth_value(&tx.value_wei);
+
+    if is_sender && is_recipient {
+        line.push_str(&format!(" | Self-transfer of {}", value));
+    } else if is_sender {
+        let target = tx
+            .to
+            .as_ref()
+            .map(|addr| short_hex(addr))
+            .unwrap_or_else(|| "contract creation".into());
+        line.push_str(&format!(" | Sent {} to {}", value, target));
+    } else if is_recipient {
+        line.push_str(&format!(
+            " | Received {} from {}",
+            value,
+            short_hex(&tx.from)
+        ));
+    } else {
+        let partner = tx
+            .to
+            .as_ref()
+            .map(|addr| short_hex(addr))
+            .unwrap_or_else(|| short_hex(&tx.from));
+        line.push_str(&format!(" | Interaction {} with {}", value, partner));
+    }
+
+    line.push_str(&format!(" | Tx {}", short_hex(&tx.hash)));
+    line
+}
+
+fn format_eth_value(value: &U256) -> String {
+    if value.is_zero() {
+        return "0 ETH".into();
+    }
+    match format_units(*value, "ether") {
+        Ok(mut eth) => {
+            trim_decimal(&mut eth);
+            if eth.is_empty() {
+                "0 ETH".into()
+            } else {
+                format!("{eth} ETH")
+            }
+        }
+        Err(_) => format!("{value} wei"),
+    }
+}
+
+fn trim_decimal(value: &mut String) {
+    if let Some(_) = value.find('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
         }
     }
 }
@@ -602,6 +1069,7 @@ pub struct AppState {
     pub loading: LoadingState,
     pub selected: Option<SelectedEntity>,
     pub search_error: Option<String>,
+    pub secrets: SecretsState,
     pub favorite_addresses: HashSet<String>,
     pub favorite_transactions: HashSet<String>,
     pub current_address: Option<HydratedAddress>,
@@ -620,29 +1088,54 @@ impl AppState {
 #[derive(Debug, Default)]
 pub struct NavigationState {
     pub focused_pane: FocusedPane,
+    pub modal_return_focus: FocusedPane,
     pub sidebar_tab: SidebarTab,
     pub main_view_mode: MainViewMode,
     pub main_view_tab: MainViewTab,
 }
 
 impl NavigationState {
+    pub fn focus_pane(&mut self, pane: FocusedPane) {
+        match pane {
+            FocusedPane::Modal => self.focus_modal(),
+            other => {
+                self.focused_pane = other;
+                self.modal_return_focus = other;
+            }
+        }
+    }
+
+    pub fn focus_modal(&mut self) {
+        if self.focused_pane != FocusedPane::Modal {
+            self.modal_return_focus = self.focused_pane;
+        }
+        self.focused_pane = FocusedPane::Modal;
+    }
+
+    pub fn restore_focus_after_modal(&mut self) {
+        self.focused_pane = self.modal_return_focus;
+        self.modal_return_focus = self.focused_pane;
+    }
+
     pub fn focus_next(&mut self) {
-        self.focused_pane = match self.focused_pane {
+        let next = match self.focused_pane {
             FocusedPane::Top => FocusedPane::Sidebar,
             FocusedPane::Sidebar => FocusedPane::MainView,
             FocusedPane::MainView => FocusedPane::BottomBar,
             FocusedPane::BottomBar | FocusedPane::Modal => FocusedPane::Top,
         };
+        self.focus_pane(next);
     }
 
     pub fn focus_previous(&mut self) {
-        self.focused_pane = match self.focused_pane {
+        let previous = match self.focused_pane {
             FocusedPane::Top => FocusedPane::BottomBar,
             FocusedPane::Sidebar => FocusedPane::Top,
             FocusedPane::MainView => FocusedPane::Sidebar,
             FocusedPane::BottomBar => FocusedPane::MainView,
-            FocusedPane::Modal => FocusedPane::Top,
+            FocusedPane::Modal => self.modal_return_focus,
         };
+        self.focus_pane(previous);
     }
 
     pub fn next_main_view_tab(&mut self) {
@@ -703,17 +1196,6 @@ impl CommandBus {
         Self { sender, handle }
     }
 
-    pub fn spawn<F>(&self, task: F)
-    where
-        F: FnOnce() -> Message + Send + 'static,
-    {
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let message = task();
-            let _ = sender.send(message);
-        });
-    }
-
     pub fn spawn_async<F, Fut>(&self, task: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -724,10 +1206,6 @@ impl CommandBus {
             let message = task().await;
             let _ = sender.send(message);
         });
-    }
-
-    pub fn send(&self, message: Message) {
-        let _ = self.sender.send(message);
     }
 }
 
@@ -754,7 +1232,8 @@ pub enum Action {
     SelectionChanged(SelectedEntity),
     LoadingStarted(FocusedPane),
     LoadingFinished(FocusedPane),
-    Noop,
+    CloseModal,
+    SecretsSaved,
 }
 
 mod navigation {
@@ -764,6 +1243,7 @@ mod navigation {
         Sidebar,
         MainView,
         BottomBar,
+        #[allow(dead_code)]
         Modal,
     }
 
@@ -815,6 +1295,7 @@ mod navigation {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum MainViewTab {
+        AddressInfo,
         AddressTransactions,
         AddressInternal,
         AddressBalances,
@@ -826,7 +1307,7 @@ mod navigation {
 
     impl Default for MainViewTab {
         fn default() -> Self {
-            Self::AddressTransactions
+            Self::AddressInfo
         }
     }
 
@@ -834,11 +1315,12 @@ mod navigation {
         pub fn normalize(self, mode: MainViewMode) -> Self {
             match mode {
                 MainViewMode::Address => match self {
-                    MainViewTab::AddressTransactions
+                    MainViewTab::AddressInfo
+                    | MainViewTab::AddressTransactions
                     | MainViewTab::AddressInternal
                     | MainViewTab::AddressBalances
                     | MainViewTab::AddressPermissions => self,
-                    _ => MainViewTab::AddressTransactions,
+                    _ => MainViewTab::AddressInfo,
                 },
                 MainViewMode::Transaction => match self {
                     MainViewTab::TransactionSummary
@@ -852,10 +1334,11 @@ mod navigation {
         pub fn next(self, mode: MainViewMode) -> Self {
             match mode {
                 MainViewMode::Address => match self.normalize(mode) {
+                    MainViewTab::AddressInfo => MainViewTab::AddressTransactions,
                     MainViewTab::AddressTransactions => MainViewTab::AddressInternal,
                     MainViewTab::AddressInternal => MainViewTab::AddressBalances,
                     MainViewTab::AddressBalances => MainViewTab::AddressPermissions,
-                    MainViewTab::AddressPermissions => MainViewTab::AddressTransactions,
+                    MainViewTab::AddressPermissions => MainViewTab::AddressInfo,
                     other => other,
                 },
                 MainViewMode::Transaction => match self.normalize(mode) {
@@ -870,7 +1353,8 @@ mod navigation {
         pub fn previous(self, mode: MainViewMode) -> Self {
             match mode {
                 MainViewMode::Address => match self.normalize(mode) {
-                    MainViewTab::AddressTransactions => MainViewTab::AddressPermissions,
+                    MainViewTab::AddressInfo => MainViewTab::AddressPermissions,
+                    MainViewTab::AddressTransactions => MainViewTab::AddressInfo,
                     MainViewTab::AddressInternal => MainViewTab::AddressTransactions,
                     MainViewTab::AddressBalances => MainViewTab::AddressInternal,
                     MainViewTab::AddressPermissions => MainViewTab::AddressBalances,
@@ -896,5 +1380,36 @@ mod navigation {
         fn default() -> Self {
             Self::Addresses
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tempfile::tempdir;
+
+    #[test]
+    fn secrets_modal_accepts_urls() -> AppResult<()> {
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("EVM_TUI_DATA_DIR", tmp.path());
+        }
+
+        let mut app = App::new()?;
+        assert!(app.secrets_modal_mut().is_some());
+
+        app.handle_modal_paste("H43UPPAU7H4KBX99TSWMD3IHDG9F86IK43".into())?;
+        app.handle_modal_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        let url = "https://eth-mainnet.g.alchemy.com/v2/example-key";
+        app.handle_modal_paste(url.into())?;
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        assert_eq!(app.state.secrets.anvil_rpc_url.as_deref(), Some(url));
+
+        unsafe {
+            std::env::remove_var("EVM_TUI_DATA_DIR");
+        }
+        Ok(())
     }
 }

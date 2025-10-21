@@ -34,6 +34,7 @@ impl MainView {
     fn tab_titles(mode: MainViewMode) -> &'static [(&'static str, MainViewTab)] {
         match mode {
             MainViewMode::Address => &[
+                ("Info", MainViewTab::AddressInfo),
                 ("Transactions", MainViewTab::AddressTransactions),
                 ("Internal", MainViewTab::AddressInternal),
                 ("Balances", MainViewTab::AddressBalances),
@@ -60,6 +61,7 @@ impl MainView {
             MainViewTab::AddressInternal => "Address internal calls (placeholder)",
             MainViewTab::AddressBalances => "Address balances summary (placeholder)",
             MainViewTab::AddressPermissions => "Address permissions matrix (placeholder)",
+            MainViewTab::AddressInfo => "Address overview (placeholder)",
             MainViewTab::TransactionSummary => "Transaction summary (placeholder)",
             MainViewTab::TransactionDebug => "Transaction debugger (placeholder)",
             MainViewTab::TransactionStorageDiff => "Transaction storage diff (placeholder)",
@@ -173,12 +175,16 @@ impl Component for MainView {
 
         let address_data = match (&ctx.state.selected, &ctx.state.current_address) {
             (Some(SelectedEntity::Address(addr)), Some(data))
-                if data.identifier == addr.address => Some(data),
+                if data.identifier == addr.address =>
+            {
+                Some(data)
+            }
             _ => None,
         };
         let transaction_data = match (&ctx.state.selected, &ctx.state.current_transaction) {
-            (Some(SelectedEntity::Transaction(tx)), Some(data))
-                if data.identifier == tx.hash => Some(data),
+            (Some(SelectedEntity::Transaction(tx)), Some(data)) if data.identifier == tx.hash => {
+                Some(data)
+            }
             _ => None,
         };
 
@@ -189,6 +195,7 @@ impl Component for MainView {
                 MainViewMode::Address => {
                     if let Some(data) = address_data {
                         match tab {
+                            MainViewTab::AddressInfo => data.info.join("\n"),
                             MainViewTab::AddressTransactions => data.transactions.join("\n"),
                             MainViewTab::AddressInternal => data.internal.join("\n"),
                             MainViewTab::AddressBalances => data.balances.join("\n"),

@@ -7,6 +7,7 @@
 - `Tab` / `Shift-Tab`: optional alternative focus cycling for accessibility.
 - `q`: exit application (confirm if background jobs are running).
 - Key remapping is deferred; bindings are fixed in MVP to match documentation.
+- Secrets modal: `Tab` / `Shift-Tab` swap fields, `Enter` submits, `Esc` skips (reopens on next launch until complete).
 
 ## Focus Model
 - Global app state tracks active pane, active tab per pane, and selection indices.

@@ -2,7 +2,7 @@
 
 ## Core Concepts
 - `App` orchestrates the event loop, stores global context (focus, theme, loading flags), and owns component instances.
-- `AppState` holds immutable configuration (theme preferences, keymap) and shared mutable state (active pane, selections, hydration flags).
+- `AppState` holds immutable configuration (theme preferences, keymap) and shared mutable state (active pane, selections, hydration flags) plus resolved secrets (Etherscan API key, Anvil RPC endpoint).
 - `Action` represents user intent or async responses (`FocusPane`, `SelectTab`, `HydrationStarted`, `HydrationFinished`, etc.).
 - `Message` bridges background tasks back to the UI thread via an async channel; messages translate into actions.
 
@@ -22,6 +22,7 @@ pub trait Component {
 ## Focus & Selection
 - `FocusedPane` enum tracks which pane owns keyboard input (`Top`, `Sidebar`, `MainView`, `BottomBar`, `Modal`).
 - Each pane tracks its own tab (`TopTab`, `SidebarTab`, `MainViewTab`).
+- `NavigationState` remembers the last non-modal focus so modal dialogs can restore focus when dismissed.
 - `NavigationState` consolidates focus, tab indices, and selection pointers; expose helpers for cycling with `[`, `]`, and `h/j/k/l`.
 
 ## Loading Flags

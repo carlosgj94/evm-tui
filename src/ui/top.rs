@@ -38,7 +38,6 @@ impl Default for TopBar {
 
 #[derive(Debug, Clone)]
 pub enum TopCommand {
-    SetTitle(String),
     ActivateSearch,
     InputChar(char),
     Backspace,
@@ -56,6 +55,8 @@ pub enum TopCommand {
 }
 
 impl TopBar {
+    const LAST_QUERY_KEY: &'static str = "top:last_query";
+
     pub fn is_search_active(&self) -> bool {
         self.search_active
     }
@@ -109,7 +110,14 @@ impl TopBar {
 impl Component for TopBar {
     type Command = TopCommand;
 
-    fn init(&mut self, _ctx: &mut AppContext<'_>) -> AppResult<()> {
+    fn init(&mut self, ctx: &mut AppContext<'_>) -> AppResult<()> {
+        if let Some(raw) = ctx.storage.settings().get(Self::LAST_QUERY_KEY)? {
+            if let Ok(value) = String::from_utf8(raw) {
+                if !value.is_empty() {
+                    self.search_value = value;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -119,9 +127,6 @@ impl Component for TopBar {
         ctx: &mut AppContext<'_>,
     ) -> AppResult<Option<Action>> {
         match command {
-            TopCommand::SetTitle(title) => {
-                self.title = title.clone();
-            }
             TopCommand::ActivateSearch => {
                 self.search_active = true;
                 self.pending_search = false;
@@ -181,6 +186,9 @@ impl Component for TopBar {
                 });
                 self.search_value = query.clone();
                 self.search_active = false;
+                ctx.storage
+                    .settings()
+                    .put(Self::LAST_QUERY_KEY, query.as_bytes())?;
             }
             TopCommand::SearchFailed { query, error } => {
                 self.pending_search = false;
@@ -243,6 +251,22 @@ impl Component for TopBar {
         }
         if let Some(status) = self.status_line() {
             lines.push(status);
+        }
+        let missing_etherscan = ctx.state.secrets.etherscan_api_key.is_none();
+        let missing_anvil = ctx.state.secrets.anvil_rpc_url.is_none();
+        if missing_etherscan || missing_anvil {
+            let mut parts = Vec::new();
+            if missing_etherscan {
+                parts.push("ETHERSCAN_API_KEY");
+            }
+            if missing_anvil {
+                parts.push("ANVIL_RPC_URL");
+            }
+            let warning = format!("Missing config: {}", parts.join(", "));
+            lines.push(Line::from(Span::styled(
+                warning,
+                Style::default().fg(Color::Yellow),
+            )));
         }
 
         let widget = Paragraph::new(lines)
