@@ -17,7 +17,12 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
 };
-use std::{collections::HashSet, env, sync::mpsc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::mpsc,
+    time::{Duration as StdDuration, Instant},
+};
 
 use tokio::runtime::{Handle, Runtime};
 use tokio::time::{Duration, sleep, timeout};
@@ -27,9 +32,7 @@ pub use navigation::{FocusedPane, MainViewMode, MainViewTab, SidebarTab};
 mod anvil;
 use self::anvil::{AccountOverview, fetch_account_overview, fetch_latest_block};
 mod etherscan;
-use self::etherscan::{
-    AddressTransaction, TransactionFetchError, TransactionListSource, fetch_address_transactions,
-};
+use self::etherscan::{AddressTransaction, TransactionFetchError, fetch_address_transactions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectedEntity {
@@ -56,10 +59,130 @@ pub struct HydratedAddress {
     pub identifier: String,
     pub info: Vec<String>,
     pub transactions: Vec<String>,
+    pub transactions_table: Option<AddressTransactionsTable>,
     pub internal: Vec<String>,
     pub balances: Vec<String>,
     pub permissions: Vec<String>,
     pub overview: Option<AccountOverview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTransactionsTable {
+    pub source_label: String,
+    pub source_api_version: String,
+    pub limit: usize,
+    pub rows: Vec<AddressTransactionRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTransactionRow {
+    pub hash: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub value_wei: U256,
+    pub block_number: Option<u64>,
+    pub direction: TransactionDirection,
+    pub counterparty: String,
+    pub value_display: String,
+    pub status: TransactionStatus,
+    pub calldata: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionDirection {
+    Incoming,
+    Outgoing,
+    SelfTransfer,
+    Interaction,
+}
+
+impl TransactionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            TransactionStatus::Success => "OK",
+            TransactionStatus::Failed => "Failed",
+        }
+    }
+}
+
+impl TransactionDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            TransactionDirection::Incoming => "Incoming",
+            TransactionDirection::Outgoing => "Outgoing",
+            TransactionDirection::SelfTransfer => "Self",
+            TransactionDirection::Interaction => "Interaction",
+        }
+    }
+}
+
+impl AddressTransactionRow {
+    pub fn from_transaction(target_address: &str, tx: &AddressTransaction) -> Self {
+        let is_sender = tx.from.eq_ignore_ascii_case(target_address);
+        let is_recipient = tx
+            .to
+            .as_ref()
+            .map(|addr| addr.eq_ignore_ascii_case(target_address))
+            .unwrap_or(false);
+
+        let direction = if is_sender && is_recipient {
+            TransactionDirection::SelfTransfer
+        } else if is_sender {
+            TransactionDirection::Outgoing
+        } else if is_recipient {
+            TransactionDirection::Incoming
+        } else {
+            TransactionDirection::Interaction
+        };
+
+        let counterparty = if is_sender && is_recipient {
+            "Self".to_string()
+        } else if is_sender {
+            tx.to
+                .as_ref()
+                .map(|addr| short_hex(addr))
+                .unwrap_or_else(|| "Contract creation".into())
+        } else if is_recipient {
+            short_hex(&tx.from)
+        } else {
+            tx.to
+                .as_ref()
+                .map(|addr| short_hex(addr))
+                .unwrap_or_else(|| short_hex(&tx.from))
+        };
+
+        let mut value = format_eth_value(&tx.value_wei);
+        if !tx.value_wei.is_zero() {
+            match direction {
+                TransactionDirection::Outgoing => value = format!("-{value}"),
+                TransactionDirection::Incoming => value = format!("+{value}"),
+                _ => {}
+            }
+        }
+
+        AddressTransactionRow {
+            hash: tx.hash.clone(),
+            from: tx.from.clone(),
+            to: tx.to.clone(),
+            value_wei: tx.value_wei,
+            block_number: (tx.block_number > 0).then_some(tx.block_number),
+            direction,
+            counterparty,
+            value_display: value,
+            status: if tx.is_error {
+                TransactionStatus::Failed
+            } else {
+                TransactionStatus::Success
+            },
+            calldata: tx.input.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +191,12 @@ pub struct HydratedTransaction {
     pub summary: Vec<String>,
     pub debug: Vec<String>,
     pub storage_diff: Vec<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub value_formatted: Option<String>,
+    pub calldata: Option<String>,
+    pub block_number: Option<u64>,
+    pub status: Option<TransactionStatus>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,7 +343,7 @@ impl App {
             }
         }
 
-        Ok(Self {
+        let mut app = Self {
             running: false,
             state,
             storage,
@@ -224,9 +353,15 @@ impl App {
             bottom_bar,
             runtime,
             message_rx,
-            message_tx,
+            message_tx: message_tx.clone(),
             secrets_modal,
-        })
+        };
+
+        if let Some(entity) = app.state.selected.clone() {
+            app.start_hydration(entity);
+        }
+
+        Ok(app)
     }
 
     pub fn run(mut self, mut terminal: DefaultTerminal) -> AppResult<()> {
@@ -245,7 +380,7 @@ impl App {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(3),
             ])
             .split(frame.area());
 
@@ -275,11 +410,13 @@ impl App {
     }
 
     fn handle_events(&mut self) -> AppResult<()> {
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key)?,
-            Event::Paste(content) => self.on_paste_event(content)?,
-            Event::Mouse(_) | Event::Resize(_, _) => {}
-            _ => {}
+        if event::poll(StdDuration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key)?,
+                Event::Paste(content) => self.on_paste_event(content)?,
+                Event::Mouse(_) | Event::Resize(_, _) => {}
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -349,6 +486,21 @@ impl App {
                     self.dispatch(Action::FocusPane(pane));
                 }
             }
+            (KeyModifiers::NONE, KeyCode::Enter) => match self.state.navigation.focused_pane {
+                FocusedPane::MainView => {
+                    self.main_view_command(MainViewCommand::ActivateSelection)?;
+                }
+                FocusedPane::Sidebar => {
+                    if let Some(entity) = self
+                        .sidebar
+                        .active_selection(self.state.navigation.sidebar_tab)
+                    {
+                        self.dispatch(Action::SelectionChanged(entity));
+                    }
+                    self.dispatch(Action::FocusPane(FocusedPane::MainView));
+                }
+                _ => {}
+            },
             (KeyModifiers::NONE, KeyCode::Char('f'))
                 if matches!(self.state.navigation.focused_pane, FocusedPane::MainView) =>
             {
@@ -501,21 +653,51 @@ impl App {
 
         let mut hydrated = build_address_view(addr, overview, note, rpc_url, block_note);
 
-        hydrated.transactions = match transactions_result {
-            Ok((entries, source)) => format_transaction_lines(
-                &hydrated.identifier,
-                &entries,
-                &source,
-                TRANSACTION_FETCH_LIMIT,
-            ),
-            Err(TransactionFetchError::MissingApiKey) => vec![
-                "Add an Etherscan API key to load recent transactions.".into(),
-                "Open Settings → Secrets and enter ETHERSCAN_API_KEY.".into(),
-            ],
-            Err(TransactionFetchError::UnsupportedChain(chain)) => vec![format!(
-                "No Etherscan-compatible explorer configured for chain {chain}."
-            )],
-            Err(err) => vec![format!("Failed to load transactions: {err}")],
+        match transactions_result {
+            Ok((entries, source)) => {
+                let rows: Vec<AddressTransactionRow> = entries
+                    .iter()
+                    .map(|tx| AddressTransactionRow::from_transaction(&hydrated.identifier, tx))
+                    .collect();
+                if rows.is_empty() {
+                    hydrated.transactions = vec![format!(
+                        "No transactions available via {} ({}).",
+                        source.label, source.api_version
+                    )];
+                    hydrated.transactions_table = None;
+                } else {
+                    hydrated.transactions = vec![format!(
+                        "Latest {} transaction(s) via {} ({}) • newest first (max {}).",
+                        rows.len(),
+                        source.label,
+                        source.api_version,
+                        TRANSACTION_FETCH_LIMIT
+                    )];
+                    hydrated.transactions_table = Some(AddressTransactionsTable {
+                        source_label: source.label.into(),
+                        source_api_version: source.api_version.into(),
+                        limit: TRANSACTION_FETCH_LIMIT,
+                        rows,
+                    });
+                }
+            }
+            Err(TransactionFetchError::MissingApiKey) => {
+                hydrated.transactions = vec![
+                    "Add an Etherscan API key to load recent transactions.".into(),
+                    "Open Settings → Secrets and enter ETHERSCAN_API_KEY.".into(),
+                ];
+                hydrated.transactions_table = None;
+            }
+            Err(TransactionFetchError::UnsupportedChain(chain)) => {
+                hydrated.transactions = vec![format!(
+                    "No Etherscan-compatible explorer configured for chain {chain}."
+                )];
+                hydrated.transactions_table = None;
+            }
+            Err(err) => {
+                hydrated.transactions = vec![format!("Failed to load transactions: {err}")];
+                hydrated.transactions_table = None;
+            }
         };
 
         hydrated
@@ -537,6 +719,7 @@ impl App {
                 self.state.search_error = None;
                 match entity {
                     SelectedEntity::Address(_) => {
+                        self.state.address_transactions_view.reset();
                         self.state.navigation.main_view_mode = MainViewMode::Address;
                         self.state.navigation.main_view_tab = MainViewTab::AddressInfo;
                     }
@@ -580,7 +763,9 @@ impl App {
                 Movement::Left | Movement::Right => {}
             },
             FocusedPane::MainView => match movement {
-                Movement::Left | Movement::Right | Movement::Up | Movement::Down => {}
+                Movement::Up => self.main_view_command(MainViewCommand::MoveSelectionUp)?,
+                Movement::Down => self.main_view_command(MainViewCommand::MoveSelectionDown)?,
+                Movement::Left | Movement::Right => {}
             },
             FocusedPane::Top | FocusedPane::BottomBar | FocusedPane::Modal => {}
         }
@@ -644,47 +829,106 @@ impl App {
 
     fn start_hydration(&mut self, entity: SelectedEntity) {
         match entity {
-            SelectedEntity::Address(addr) => {
-                self.state.current_address = None;
-                self.state.loading.set_loading(FocusedPane::MainView, true);
-                self.show_status(format!(
-                    "Fetching latest activity for {}",
-                    short_hex(&addr.address)
-                ));
-                let bus = self.command_bus();
-                let secrets = self.state.secrets.clone();
-                bus.spawn_async(move || {
-                    let addr_ref = addr.clone();
-                    let secrets_clone = secrets.clone();
-                    async move {
-                        let data = Self::hydrate_address(addr_ref.clone(), secrets_clone).await;
-                        Message::AddressHydrated(data)
-                    }
-                });
-            }
+            SelectedEntity::Address(addr) => self.start_address_hydration(addr),
             SelectedEntity::Transaction(tx) => {
-                self.state.current_transaction = None;
-                self.state.loading.set_loading(FocusedPane::MainView, true);
-                let bus = self.command_bus();
-                bus.spawn_async(move || {
-                    let tx_ref = tx.clone();
-                    async move {
-                        sleep(Duration::from_millis(350)).await;
-                        let short = short_hex(&tx_ref.hash);
-                        Message::TransactionHydrated(HydratedTransaction {
-                            identifier: tx_ref.hash.clone(),
-                            summary: vec![
-                                format!("Hash: {}", short),
-                                "Block: 18,551,234".into(),
-                                "Gas Used: 120,000".into(),
-                            ],
-                            debug: vec!["step 42: CALL".into(), "step 87: SSTORE".into()],
-                            storage_diff: vec!["contract 0xdead… writes slot 0x00".into()],
-                        })
-                    }
-                });
+                let mut preview = self.state.pending_transaction_preview.take();
+                if preview.is_none() {
+                    preview = self.state.transaction_preview_cache.get(&tx.hash).cloned();
+                }
+                self.start_transaction_hydration(tx, preview);
             }
         }
+    }
+
+    fn start_address_hydration(&mut self, addr: AddressRef) {
+        self.state.current_address = None;
+        self.state.loading.set_loading(FocusedPane::MainView, true);
+        self.show_status(format!(
+            "Fetching latest activity for {}",
+            short_hex(&addr.address)
+        ));
+        let bus = self.command_bus();
+        let secrets = self.state.secrets.clone();
+        bus.spawn_async(move || {
+            let addr_ref = addr.clone();
+            let secrets_clone = secrets.clone();
+            async move {
+                let data = Self::hydrate_address(addr_ref.clone(), secrets_clone).await;
+                Message::AddressHydrated(data)
+            }
+        });
+    }
+
+    fn start_transaction_hydration(
+        &mut self,
+        tx: TransactionRef,
+        preview: Option<AddressTransactionRow>,
+    ) {
+        self.state.current_transaction = None;
+        self.state.loading.set_loading(FocusedPane::MainView, true);
+        self.show_status(format!("Loading transaction {}", short_hex(&tx.hash)));
+        if let Some(row) = preview.as_ref() {
+            self.state
+                .transaction_preview_cache
+                .insert(row.hash.clone(), row.clone());
+        }
+        let bus = self.command_bus();
+        bus.spawn_async(move || {
+            let tx_ref = tx.clone();
+            let preview_clone = preview.clone();
+            async move {
+                sleep(Duration::from_millis(350)).await;
+                let short = short_hex(&tx_ref.hash);
+                let mut summary = vec![format!("Hash: {}", short)];
+                let mut status = None;
+                let mut block_number = None;
+                let mut from = None;
+                let mut to = None;
+                let mut value_formatted = None;
+                let preview_calldata = preview_clone.as_ref().and_then(|row| row.calldata.clone());
+                let calldata_message = preview_calldata.clone().unwrap_or_else(|| {
+                    "Calldata unavailable (connect debugger or provider)".to_string()
+                });
+                if let Some(row) = preview_clone.as_ref() {
+                    from = Some(row.from.clone());
+                    to = row.to.clone();
+                    value_formatted = Some(row.value_display.clone());
+                    block_number = row.block_number;
+                    status = Some(row.status);
+                    summary.push(format!("Status: {}", row.status.label()));
+                    summary.push(format!("From: {}", short_hex(&row.from)));
+                    summary.push(format!(
+                        "To: {}",
+                        row.to
+                            .as_ref()
+                            .map(|addr| short_hex(addr))
+                            .unwrap_or_else(|| "Contract creation".into())
+                    ));
+                    summary.push(format!("Value: {}", row.value_display));
+                    if let Some(block) = row.block_number {
+                        summary.push(format!("Block: {block}"));
+                    }
+                } else {
+                    summary.push("Status: Not cached".into());
+                    summary.push("From: Not cached".into());
+                    summary.push("To: Not cached".into());
+                    summary.push("Value: Not cached".into());
+                }
+                summary.push(format!("Calldata: {calldata_message}"));
+                Message::TransactionHydrated(HydratedTransaction {
+                    identifier: tx_ref.hash.clone(),
+                    summary,
+                    debug: vec!["Trace data unavailable. Configure Alloy debug adapter.".into()],
+                    storage_diff: vec!["Storage diff requires debugger export (`e`).".into()],
+                    from,
+                    to,
+                    value_formatted,
+                    calldata: preview_calldata,
+                    block_number,
+                    status,
+                })
+            }
+        });
     }
 
     fn toggle_favorite(&mut self) -> AppResult<()> {
@@ -837,6 +1081,10 @@ impl App {
                 Message::AddressHydrated(data) => {
                     if let Some(SelectedEntity::Address(addr)) = self.state.selected.as_ref() {
                         if addr.address == data.identifier {
+                            let cached_rows = data
+                                .transactions_table
+                                .as_ref()
+                                .map(|table| table.rows.clone());
                             let status_message = data
                                 .overview
                                 .as_ref()
@@ -858,7 +1106,17 @@ impl App {
                                 })
                                 .or_else(|| data.info.first().cloned())
                                 .unwrap_or_else(|| "No account data available.".into());
+                            let row_count =
+                                cached_rows.as_ref().map(|rows| rows.len()).unwrap_or(0);
                             self.state.current_address = Some(data);
+                            self.state.address_transactions_view.clamp(row_count);
+                            if let Some(rows) = cached_rows {
+                                for row in rows {
+                                    self.state
+                                        .transaction_preview_cache
+                                        .insert(row.hash.clone(), row);
+                                }
+                            }
                             self.show_status(status_message);
                             self.dispatch(Action::LoadingFinished(FocusedPane::MainView));
                         }
@@ -926,7 +1184,7 @@ pub(crate) fn build_address_view(
     }
 
     if transactions.is_empty() {
-        transactions.push("Transactions not yet implemented.".into());
+        transactions.push("Transactions will appear once data is fetched.".into());
     }
 
     let internal = vec!["Internal transactions not yet implemented.".into()];
@@ -937,89 +1195,12 @@ pub(crate) fn build_address_view(
         identifier: addr.address,
         info,
         transactions,
+        transactions_table: None,
         internal,
         balances,
         permissions,
         overview,
     }
-}
-
-fn format_transaction_lines(
-    target_address: &str,
-    entries: &[AddressTransaction],
-    source: &TransactionListSource,
-    limit: usize,
-) -> Vec<String> {
-    if entries.is_empty() {
-        return vec![format!(
-            "No transactions available via {} ({}).",
-            source.label, source.api_version
-        )];
-    }
-
-    let mut lines = Vec::with_capacity(entries.len() + 1);
-    lines.push(format!(
-        "Showing {} transaction(s) via {} ({}) (max {}).",
-        entries.len(),
-        source.label,
-        source.api_version,
-        limit
-    ));
-
-    for tx in entries {
-        lines.push(format_transaction_line(target_address, tx));
-    }
-
-    lines
-}
-
-fn format_transaction_line(target_address: &str, tx: &AddressTransaction) -> String {
-    let is_sender = tx.from.eq_ignore_ascii_case(target_address);
-    let is_recipient = tx
-        .to
-        .as_ref()
-        .map(|addr| addr.eq_ignore_ascii_case(target_address))
-        .unwrap_or(false);
-
-    let mut line = String::new();
-    if tx.is_error {
-        line.push_str("FAILED | ");
-    }
-
-    if tx.block_number > 0 {
-        line.push_str(&format!("Block {}", tx.block_number));
-    } else {
-        line.push_str("Block ?");
-    }
-
-    let value = format_eth_value(&tx.value_wei);
-
-    if is_sender && is_recipient {
-        line.push_str(&format!(" | Self-transfer of {}", value));
-    } else if is_sender {
-        let target = tx
-            .to
-            .as_ref()
-            .map(|addr| short_hex(addr))
-            .unwrap_or_else(|| "contract creation".into());
-        line.push_str(&format!(" | Sent {} to {}", value, target));
-    } else if is_recipient {
-        line.push_str(&format!(
-            " | Received {} from {}",
-            value,
-            short_hex(&tx.from)
-        ));
-    } else {
-        let partner = tx
-            .to
-            .as_ref()
-            .map(|addr| short_hex(addr))
-            .unwrap_or_else(|| short_hex(&tx.from));
-        line.push_str(&format!(" | Interaction {} with {}", value, partner));
-    }
-
-    line.push_str(&format!(" | Tx {}", short_hex(&tx.hash)));
-    line
 }
 
 fn format_eth_value(value: &U256) -> String {
@@ -1074,6 +1255,28 @@ pub struct AppState {
     pub favorite_transactions: HashSet<String>,
     pub current_address: Option<HydratedAddress>,
     pub current_transaction: Option<HydratedTransaction>,
+    pub address_transactions_view: AddressTransactionsViewState,
+    pub pending_transaction_preview: Option<AddressTransactionRow>,
+    pub transaction_preview_cache: HashMap<String, AddressTransactionRow>,
+}
+
+#[derive(Debug, Default)]
+pub struct AddressTransactionsViewState {
+    pub selected_index: usize,
+}
+
+impl AddressTransactionsViewState {
+    pub fn reset(&mut self) {
+        self.selected_index = 0;
+    }
+
+    pub fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.reset();
+        } else if self.selected_index >= len {
+            self.selected_index = len.saturating_sub(1);
+        }
+    }
 }
 
 impl AppState {

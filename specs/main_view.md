@@ -6,14 +6,15 @@ Display detailed information for the active address or transaction and host adva
 ## Address Layout
 - Tabs: `Transactions`, `Internal`, `Balances`, `Permissions`.
 - Default to Transactions list with pagination and filters by chain or method signature.
-- Transactions tab surfaces the most recent on-chain activity fetched from the configured Anvil RPC endpoint and explains when no transactions were found in the recent block window.
+- Transactions tab surfaces the most recent on-chain activity fetched from the configured sources and explains when no transactions were found in the recent block window.
+- Transactions tab renders a compact table with columns `Status`, `Tx Hash`, `Direction`, _(spacer)_, `Counterparty`, `Value`, and `Block`; highlight rows with `j`/`k`, press `Enter` to pivot into the transaction view, and use `[F]` to favorite/unfavorite directly from the table.
 - Internal tab surfaces internal calls with call tree visualization.
 - Balances tab aggregates token balances (native and ERC20) with fiat estimates when available.
 - Permissions tab lists contracts where the address has roles; highlight high-risk scopes.
 
 ## Transaction Layout
 - Tabs: `Summary`, `Debug`, `Storage Diff`.
-- Summary renders block, value, gas, participants, decoded call data, and status badges.
+- Summary renders status, from/to participants, formatted value, block number, hash, and indicates calldata availability (placeholder until debugger wiring lands).
 - Debug tab integrates Alloy tracing to step through opcodes and, where ABI is available, source-level playback similar to Tenderly.
 - Storage Diff tab compares pre/post state for touched contracts; highlight write hotspots and expose an `e` keybinding to export the diff as JSON under `exports/<tx_hash>.json`.
 

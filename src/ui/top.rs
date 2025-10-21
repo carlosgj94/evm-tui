@@ -229,6 +229,7 @@ impl Component for TopBar {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };

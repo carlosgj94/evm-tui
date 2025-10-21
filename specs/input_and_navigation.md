@@ -3,6 +3,8 @@
 ## Key Map
 - `h` `j` `k` `l`: move within the focused pane, mirroring Vim semantics.
 - `[` `]`: cycle backward/forward through tabs within the pane.
+- `Enter`: when the Main View is focused on the address transactions table, open the highlighted transaction in transaction mode.
+- `f` / `F`: toggle favorites for the focused entity (address row or transaction row).
 - `1`..`9`: focus numbered panes (Top=1, Sidebar=2, Main View=3, Bottom Bar reserved for future).
 - `Tab` / `Shift-Tab`: optional alternative focus cycling for accessibility.
 - `q`: exit application (confirm if background jobs are running).

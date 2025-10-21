@@ -94,6 +94,10 @@ impl Sidebar {
         self.selected_entity(tab, index)
     }
 
+    pub fn active_selection(&self, tab: SidebarTab) -> Option<SelectedEntity> {
+        self.selected_entity(tab, self.selected_index)
+    }
+
     fn display_label(&self, tab: SidebarTab, index: usize) -> String {
         match tab {
             SidebarTab::Addresses => self
@@ -234,6 +238,7 @@ impl Component for Sidebar {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };

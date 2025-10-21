@@ -19,6 +19,7 @@ pub struct AddressTransaction {
     pub to: Option<String>,
     pub value_wei: U256,
     pub is_error: bool,
+    pub input: Option<String>,
 }
 
 #[derive(Debug)]
@@ -172,6 +173,12 @@ pub async fn fetch_address_transactions(
             let value_wei = U256::from_str(&raw.value).unwrap_or_default();
             let is_error = matches!(raw.is_error.as_deref(), Some("1"))
                 || matches!(raw.txreceipt_status.as_deref(), Some("0"));
+            let input = raw.input.trim();
+            let input = if input.is_empty() || input.eq_ignore_ascii_case("0x") {
+                None
+            } else {
+                Some(input.to_string())
+            };
             AddressTransaction {
                 hash: raw.hash,
                 block_number,
@@ -179,6 +186,7 @@ pub async fn fetch_address_transactions(
                 to,
                 value_wei,
                 is_error,
+                input,
             }
         })
         .collect();
@@ -212,4 +220,6 @@ struct RawTransaction {
     is_error: Option<String>,
     #[serde(default)]
     txreceipt_status: Option<String>,
+    #[serde(default)]
+    input: String,
 }

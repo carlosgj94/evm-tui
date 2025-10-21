@@ -4,7 +4,7 @@
 Provide contextual keyboard hints and status indicators without occupying valuable vertical space.
 
 ## Content
-- Always show global shortcuts (`q Quit`, `[ / ] Tabs`, `h/j/k/l Move`, `1..9 Focus`).
+ - Always show global shortcuts (`q Quit`, `[ Prev Tab`, `] Next Tab`, `h/j/k/l Move`, `Enter Open`, `1..9 Focus`, `[F] Favorite/Remove`).
 - Secondary region displays context-sensitive actions from the currently focused pane (e.g., `Enter Open`, `d Remove Favorite`).
 - Reserve a right-aligned slot for transient status (sync progress, rate-limit warnings).
 - Shortcut order is fixed to match documentation; no user reordering in MVP.

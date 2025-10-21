@@ -24,6 +24,8 @@ pub trait Component {
 - Each pane tracks its own tab (`TopTab`, `SidebarTab`, `MainViewTab`).
 - `NavigationState` remembers the last non-modal focus so modal dialogs can restore focus when dismissed.
 - `NavigationState` consolidates focus, tab indices, and selection pointers; expose helpers for cycling with `[`, `]`, and `h/j/k/l`.
+- `AddressTransactionsViewState` keeps the highlighted row index for the address transactions table so `j`/`k` navigation and `Enter` activation stay consistent across hydration updates.
+- `AppState::pending_transaction_preview` caches the currently highlighted address-transaction row so the transaction view can render an immediate summary (from/to/value/block) before deeper hydration finishes.
 
 ## Loading Flags
 - Shared `LoadingState` from `specs/loading_refresh.md`: per-pane booleans plus timestamps (`Option<Instant>`).

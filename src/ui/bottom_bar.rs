@@ -40,11 +40,12 @@ impl Component for BottomBar {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let widget = Paragraph::new(Line::from(
-            "q Quit • [ / ] Tabs • h j k l Move • 1..9 Focus • f Toggle Favorite",
+            "q Quit • [ Prev Tab • ] Next Tab • h j k l Move • Enter Open • 1..9 Focus • [F] Favorite/Remove",
         ))
         .block(Block::bordered().title(Line::from("[4] Keymap").style(style)));
         frame.render_widget(widget, area);
